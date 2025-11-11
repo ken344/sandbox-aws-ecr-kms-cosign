@@ -1,0 +1,503 @@
+name: Single Image Build, Sign & Verify
+
+on:
+  # 手動実行
+  workflow_dispatch:
+    inputs:
+      repository_name:
+        description: 'ECR repository name'
+        required: true
+        type: choice
+        options:
+          - sample-app-1
+          - sample-app-2
+          - sample-app-3
+      image_count:
+        description: 'Number of images to push'
+        required: false
+        default: '5'
+        type: string
+      image_tag_prefix:
+        description: 'Image tag prefix (optional)'
+        required: false
+        default: 'test'
+        type: string
+
+# OIDC用の権限
+permissions:
+  id-token: write   # AWS OIDC認証用
+  contents: read    # リポジトリの読み取り
+
+env:
+  AWS_REGION: ap-northeast-1
+
+jobs:
+  build-sign-verify:
+    name: Build, Sign & Verify
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set workflow variables
+        id: vars
+        run: |
+          echo "repository=${{ inputs.repository_name }}" >> $GITHUB_OUTPUT
+          echo "image_count=${{ inputs.image_count }}" >> $GITHUB_OUTPUT
+          echo "tag_prefix=${{ inputs.image_tag_prefix }}" >> $GITHUB_OUTPUT
+          echo "run_id=${{ github.run_number }}" >> $GITHUB_OUTPUT
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-${{ github.run_id }}
+      
+      - name: Verify AWS identity
+        run: |
+          echo "=== AWS Identity ==="
+          aws sts get-caller-identity
+          echo ""
+          echo "=== Target Configuration ==="
+          echo "Repository: ${{ steps.vars.outputs.repository }}"
+          echo "Image Count: ${{ steps.vars.outputs.image_count }}"
+          echo "Tag Prefix: ${{ steps.vars.outputs.tag_prefix }}"
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.2.4'
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Check initial image count
+        id: initial-check
+        env:
+          ECR_REPOSITORY: ${{ steps.vars.outputs.repository }}
+        run: |
+          echo "=== Initial State ==="
+          
+          INITIAL_COUNT=$(aws ecr describe-images \
+            --repository-name $ECR_REPOSITORY \
+            --region ${{ env.AWS_REGION }} \
+            --query 'length(imageDetails)' \
+            --output text 2>/dev/null || echo "0")
+          
+          echo "Initial image count: $INITIAL_COUNT"
+          echo "initial_count=$INITIAL_COUNT" >> $GITHUB_OUTPUT
+          
+          # イメージ一覧を表示（最新10件）
+          echo ""
+          echo "Current images (latest 10):"
+          aws ecr describe-images \
+            --repository-name $ECR_REPOSITORY \
+            --region ${{ env.AWS_REGION }} \
+            --query 'reverse(sort_by(imageDetails,& imagePushedAt))[0:10].[imageTags[0] || `<untagged>`, imagePushedAt]' \
+            --output table 2>/dev/null || echo "No images found"
+      
+      - name: Build and push images
+        id: build-push
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ steps.vars.outputs.repository }}
+          IMAGE_COUNT: ${{ steps.vars.outputs.image_count }}
+          TAG_PREFIX: ${{ steps.vars.outputs.tag_prefix }}
+          RUN_ID: ${{ steps.vars.outputs.run_id }}
+        run: |
+          echo "=== Building $IMAGE_COUNT images for $ECR_REPOSITORY ==="
+          
+          # 結果を保存
+          RESULTS_FILE="build-results.json"
+          echo '{"repository": "'$ECR_REPOSITORY'", "images": []}' > $RESULTS_FILE
+          
+          for i in $(seq 1 $IMAGE_COUNT); do
+            IMAGE_TAG=$(printf "${TAG_PREFIX}-%s-%03d" "$RUN_ID" $i)
+            IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+            
+            echo ""
+            echo "[$i/$IMAGE_COUNT] Building: $IMAGE_TAG"
+            
+            # Dockerfileを動的生成
+            BUILD_DIR="/tmp/build-$i"
+            mkdir -p $BUILD_DIR
+            
+            cat > $BUILD_DIR/Dockerfile << EOF
+          FROM alpine:latest
+          
+          LABEL org.opencontainers.image.source="https://github.com/${{ github.repository }}"
+          LABEL org.opencontainers.image.revision="${{ github.sha }}"
+          LABEL org.opencontainers.image.created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          LABEL app.repository="$ECR_REPOSITORY"
+          LABEL app.image.number="$i"
+          
+          RUN echo "=== Image Information ===" > /image-info.txt && \
+              echo "Repository: $ECR_REPOSITORY" >> /image-info.txt && \
+              echo "Image number: $i of $IMAGE_COUNT" >> /image-info.txt && \
+              echo "Workflow run: $RUN_ID" >> /image-info.txt && \
+              echo "Git SHA: ${{ github.sha }}" >> /image-info.txt && \
+              echo "Tag: $IMAGE_TAG" >> /image-info.txt && \
+              echo "Build time: \$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> /image-info.txt && \
+              echo "Random ID: \$RANDOM" >> /image-info.txt && \
+              echo "========================" >> /image-info.txt
+          
+          CMD cat /image-info.txt
+          EOF
+            
+            # ビルド
+            echo "  Building..."
+            docker build -t $IMAGE_URI $BUILD_DIR
+            
+            # プッシュ
+            echo "  Pushing..."
+            docker push $IMAGE_URI
+            
+            # ダイジェストを取得
+            DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE_URI | cut -d'@' -f2)
+            IMAGE_WITH_DIGEST="$ECR_REGISTRY/$ECR_REPOSITORY@$DIGEST"
+            
+            echo "  Digest: $DIGEST"
+            
+            # 結果をJSON配列に追加
+            jq --arg tag "$IMAGE_TAG" \
+               --arg digest "$DIGEST" \
+               --arg uri "$IMAGE_WITH_DIGEST" \
+               --arg number "$i" \
+               '.images += [{"number": ($number | tonumber), "tag": $tag, "digest": $digest, "uri": $uri}]' \
+               $RESULTS_FILE > tmp.$$ && mv tmp.$$ $RESULTS_FILE
+            
+            echo "  ✓ Completed: $IMAGE_TAG"
+          done
+          
+          echo ""
+          echo "=== Build Complete ==="
+          echo "Repository: $ECR_REPOSITORY"
+          echo "Images built: $IMAGE_COUNT"
+          cat $RESULTS_FILE | jq .
+          
+          # GitHub output
+          echo "results_file=$RESULTS_FILE" >> $GITHUB_OUTPUT
+      
+      - name: Sign images with Cosign
+        env:
+          KMS_KEY_ARN: ${{ secrets.KMS_KEY_ARN }}
+          ECR_REPOSITORY: ${{ steps.vars.outputs.repository }}
+        run: |
+          echo "=== Signing images with Cosign ==="
+          
+          RESULTS_FILE="${{ steps.build-push.outputs.results_file }}"
+          SIGN_RESULTS="signature-results.json"
+          echo '{"signatures": []}' > $SIGN_RESULTS
+          
+          IMAGE_COUNT=$(jq '.images | length' $RESULTS_FILE)
+          
+          for i in $(seq 0 $((IMAGE_COUNT - 1))); do
+            URI=$(jq -r ".images[$i].uri" $RESULTS_FILE)
+            TAG=$(jq -r ".images[$i].tag" $RESULTS_FILE)
+            NUM=$(jq -r ".images[$i].number" $RESULTS_FILE)
+            
+            echo ""
+            echo "[$((i + 1))/$IMAGE_COUNT] Signing: $TAG"
+            echo "  URI: $URI"
+            
+            # 署名
+            if cosign sign --key awskms:///$KMS_KEY_ARN \
+              --annotations="workflow-run=${{ github.run_number }}" \
+              --annotations="git-sha=${{ github.sha }}" \
+              --annotations="repository=$ECR_REPOSITORY" \
+              --annotations="image-number=$NUM" \
+              --annotations="tag=$TAG" \
+              --yes \
+              $URI; then
+              echo "  ✓ Signed successfully"
+              STATUS="signed"
+            else
+              echo "  ✗ Signing failed"
+              STATUS="failed"
+            fi
+            
+            # 結果を記録
+            jq --arg uri "$URI" \
+               --arg tag "$TAG" \
+               --arg status "$STATUS" \
+               '.signatures += [{"uri": $uri, "tag": $tag, "status": $status}]' \
+               $SIGN_RESULTS > tmp.$$ && mv tmp.$$ $SIGN_RESULTS
+          done
+          
+          echo ""
+          echo "=== Signing Complete ==="
+          cat $SIGN_RESULTS | jq .
+          
+          # GitHub output
+          echo "sign_results_file=$SIGN_RESULTS" >> $GITHUB_OUTPUT
+      
+      - name: Verify signatures
+        env:
+          KMS_KEY_ARN: ${{ secrets.KMS_KEY_ARN }}
+        run: |
+          echo "=== Verifying signatures ==="
+          
+          RESULTS_FILE="${{ steps.build-push.outputs.results_file }}"
+          VERIFY_RESULTS="verification-results.json"
+          echo '{"verifications": []}' > $VERIFY_RESULTS
+          
+          IMAGE_COUNT=$(jq '.images | length' $RESULTS_FILE)
+          VALID_COUNT=0
+          INVALID_COUNT=0
+          
+          for i in $(seq 0 $((IMAGE_COUNT - 1))); do
+            URI=$(jq -r ".images[$i].uri" $RESULTS_FILE)
+            TAG=$(jq -r ".images[$i].tag" $RESULTS_FILE)
+            
+            echo ""
+            echo "[$((i + 1))/$IMAGE_COUNT] Verifying: $TAG"
+            
+            # 検証
+            if cosign verify --key awskms:///$KMS_KEY_ARN $URI > /dev/null 2>&1; then
+              echo "  ✓ Signature valid"
+              STATUS="valid"
+              VALID_COUNT=$((VALID_COUNT + 1))
+            else
+              echo "  ✗ Signature invalid"
+              STATUS="invalid"
+              INVALID_COUNT=$((INVALID_COUNT + 1))
+            fi
+            
+            # 結果を記録
+            jq --arg uri "$URI" \
+               --arg tag "$TAG" \
+               --arg status "$STATUS" \
+               '.verifications += [{"uri": $uri, "tag": $tag, "status": $status}]' \
+               $VERIFY_RESULTS > tmp.$$ && mv tmp.$$ $VERIFY_RESULTS
+          done
+          
+          echo ""
+          echo "=== Verification Complete ==="
+          echo "Valid signatures: $VALID_COUNT/$IMAGE_COUNT"
+          echo "Invalid signatures: $INVALID_COUNT/$IMAGE_COUNT"
+          cat $VERIFY_RESULTS | jq .
+          
+          # GitHub output
+          echo "verify_results_file=$VERIFY_RESULTS" >> $GITHUB_OUTPUT
+          echo "valid_count=$VALID_COUNT" >> $GITHUB_OUTPUT
+          echo "invalid_count=$INVALID_COUNT" >> $GITHUB_OUTPUT
+          
+          # 検証失敗があればエラー
+          if [ $INVALID_COUNT -gt 0 ]; then
+            echo "::error::Some signatures failed verification"
+            exit 1
+          fi
+      
+      - name: Check final image count
+        id: final-check
+        env:
+          ECR_REPOSITORY: ${{ steps.vars.outputs.repository }}
+        run: |
+          echo "=== Final State ==="
+          
+          FINAL_COUNT=$(aws ecr describe-images \
+            --repository-name $ECR_REPOSITORY \
+            --region ${{ env.AWS_REGION }} \
+            --query 'length(imageDetails)' \
+            --output text)
+          
+          INITIAL_COUNT=${{ steps.initial-check.outputs.initial_count }}
+          IMAGE_COUNT=${{ steps.vars.outputs.image_count }}
+          
+          echo "Initial count: $INITIAL_COUNT"
+          echo "Images pushed: $IMAGE_COUNT"
+          echo "Final count: $FINAL_COUNT"
+          echo "Expected: $((INITIAL_COUNT + IMAGE_COUNT))"
+          
+          # 署名イメージの数を確認
+          SIG_COUNT=$(aws ecr describe-images \
+            --repository-name $ECR_REPOSITORY \
+            --region ${{ env.AWS_REGION }} \
+            --query 'length(imageDetails[?imageTags && contains(to_string(imageTags), `.sig`)])' \
+            --output text)
+          
+          echo "Signature images: $SIG_COUNT"
+          
+          # 結果をGitHub outputに
+          echo "final_count=$FINAL_COUNT" >> $GITHUB_OUTPUT
+          echo "signature_count=$SIG_COUNT" >> $GITHUB_OUTPUT
+          
+          # イメージ一覧
+          echo ""
+          echo "Latest 15 images:"
+          aws ecr describe-images \
+            --repository-name $ECR_REPOSITORY \
+            --region ${{ env.AWS_REGION }} \
+            --query 'reverse(sort_by(imageDetails,& imagePushedAt))[0:15].[imageTags[0] || `<untagged>`, imagePushedAt]' \
+            --output table
+      
+      - name: Generate test report
+        run: |
+          echo "=== Generating Test Report ==="
+          
+          mkdir -p results
+          REPORT_FILE="results/test-report.md"
+          
+          cat > $REPORT_FILE << EOF
+          # Single Image Test Report
+          
+          ## Test Configuration
+          
+          - **Repository**: ${{ steps.vars.outputs.repository }}
+          - **Images pushed**: ${{ steps.vars.outputs.image_count }}
+          - **Tag prefix**: ${{ steps.vars.outputs.tag_prefix }}
+          - **Workflow run**: ${{ github.run_number }}
+          - **Git SHA**: ${{ github.sha }}
+          - **Timestamp**: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          
+          ## Results
+          
+          ### Image Counts
+          
+          - **Initial**: ${{ steps.initial-check.outputs.initial_count }}
+          - **Pushed**: ${{ steps.vars.outputs.image_count }}
+          - **Final**: ${{ steps.final-check.outputs.final_count }}
+          - **Signatures**: ${{ steps.final-check.outputs.signature_count }}
+          
+          ### Verification
+          
+          - **Valid signatures**: ${{ steps.verify-signatures.outputs.valid_count }}
+          - **Invalid signatures**: ${{ steps.verify-signatures.outputs.invalid_count }}
+          - **Success rate**: $(( ${{ steps.verify-signatures.outputs.valid_count }} * 100 / ${{ steps.vars.outputs.image_count }} ))%
+          
+          ## Images
+          
+          ### Build Results
+          
+          \`\`\`json
+          $(cat ${{ steps.build-push.outputs.results_file }} | jq .)
+          \`\`\`
+          
+          ### Signature Results
+          
+          \`\`\`json
+          $(cat ${{ steps.sign-images-with-cosign.outputs.sign_results_file }} | jq .)
+          \`\`\`
+          
+          ### Verification Results
+          
+          \`\`\`json
+          $(cat ${{ steps.verify-signatures.outputs.verify_results_file }} | jq .)
+          \`\`\`
+          
+          ## Repository State
+          
+          \`\`\`
+          $(aws ecr describe-images \
+            --repository-name ${{ steps.vars.outputs.repository }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'sort_by(imageDetails,& imagePushedAt)[*].[imageTags[0] || `<untagged>`, imagePushedAt, imageSizeInBytes]' \
+            --output table)
+          \`\`\`
+          
+          ## Notes
+          
+          - Images are signed using AWS KMS key
+          - Signatures are stored in the same ECR repository with \`.sig\` suffix
+          - Both images and signatures count toward the total image count
+          EOF
+          
+          cat $REPORT_FILE
+      
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: single-image-test-results-${{ steps.vars.outputs.repository }}
+          path: |
+            ${{ steps.build-push.outputs.results_file }}
+            ${{ steps.sign-images-with-cosign.outputs.sign_results_file }}
+            ${{ steps.verify-signatures.outputs.verify_results_file }}
+            results/test-report.md
+          retention-days: 30
+      
+      - name: Generate GitHub Summary
+        if: always()
+        run: |
+          echo "# 🎯 Single Image Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## 📊 Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Repository | \`${{ steps.vars.outputs.repository }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Images pushed | ${{ steps.vars.outputs.image_count }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag prefix | \`${{ steps.vars.outputs.tag_prefix }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Workflow run | \`${{ github.run_number }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Git SHA | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## 📦 Image Counts" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Type | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Initial | ${{ steps.initial-check.outputs.initial_count }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Pushed | ${{ steps.vars.outputs.image_count }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Final | ${{ steps.final-check.outputs.final_count }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Signatures | ${{ steps.final-check.outputs.signature_count }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## ✅ Verification Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          VALID=${{ steps.verify-signatures.outputs.valid_count }}
+          INVALID=${{ steps.verify-signatures.outputs.invalid_count }}
+          TOTAL=${{ steps.vars.outputs.image_count }}
+          
+          if [ $INVALID -eq 0 ]; then
+            echo "**Status**: ✅ All signatures verified successfully" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Status**: ⚠️ Some signatures failed verification" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Valid**: ✅ $VALID/$TOTAL" >> $GITHUB_STEP_SUMMARY
+          echo "- **Invalid**: ❌ $INVALID/$TOTAL" >> $GITHUB_STEP_SUMMARY
+          echo "- **Success rate**: $(( VALID * 100 / TOTAL ))%" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## 📁 Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Build results: \`build-results.json\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Signature results: \`signature-results.json\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Verification results: \`verification-results.json\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Detailed report: \`test-report.md\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## 🔗 Useful Commands" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "# Check current image count" >> $GITHUB_STEP_SUMMARY
+          echo "aws ecr describe-images \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --repository-name ${{ steps.vars.outputs.repository }} \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --query 'length(imageDetails)' \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --output text" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# List images" >> $GITHUB_STEP_SUMMARY
+          echo "aws ecr describe-images \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --repository-name ${{ steps.vars.outputs.repository }} \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --query 'sort_by(imageDetails,& imagePushedAt)[*].[imageTags[0], imagePushedAt]' \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --output table" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+      
+      - name: Final check
+        run: |
+          echo "=== Test Summary ==="
+          echo "✅ Repository: ${{ steps.vars.outputs.repository }}"
+          echo "✅ Images built and pushed: ${{ steps.vars.outputs.image_count }}"
+          echo "✅ All images signed with Cosign"
+          echo "✅ All signatures verified: ${{ steps.verify-signatures.outputs.valid_count }}/${{ steps.vars.outputs.image_count }}"
+          echo ""
+          echo "Test completed successfully! 🎉"
+
