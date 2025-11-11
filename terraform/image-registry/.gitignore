@@ -1,0 +1,31 @@
+# Backend設定ファイル（実際のバケット名が含まれるため除外）
+backend.tf
+
+# Terraform実行ファイル
+.terraform/
+.terraform.lock.hcl
+
+# State files（S3に保存されるため）
+terraform.tfstate
+terraform.tfstate.backup
+
+# Variable files（機密情報が含まれる可能性）
+terraform.tfvars
+*.auto.tfvars
+
+# Override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# CLI configuration files
+.terraformrc
+terraform.rc
+
+# Plan files
+*.tfplan
+
+# macOS
+.DS_Store
+

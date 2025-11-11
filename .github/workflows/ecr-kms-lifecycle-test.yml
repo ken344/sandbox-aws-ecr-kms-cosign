@@ -1,0 +1,451 @@
+name: ECR KMS Cosign & Lifecycle Test
+
+on:
+  # 手動実行を有効化
+  workflow_dispatch:
+    inputs:
+      image_count:
+        description: 'Number of images to push per repository'
+        required: false
+        default: '15'
+        type: string
+      lifecycle_limit:
+        description: 'Expected lifecycle limit (from Terraform)'
+        required: false
+        default: '10'
+        type: string
+  
+  # プッシュ時にも実行（オプション）
+  push:
+    branches:
+      - main
+    paths:
+      - 'app/**'
+      - '.github/workflows/ecr-kms-lifecycle-test.yml'
+
+# OIDC用の権限
+permissions:
+  id-token: write   # AWS OIDC認証用
+  contents: read    # リポジトリの読み取り
+
+env:
+  AWS_REGION: ap-northeast-1
+  LIFECYCLE_LIMIT: ${{ inputs.lifecycle_limit || '10' }}
+  IMAGE_COUNT: ${{ inputs.image_count || '15' }}
+
+jobs:
+  # ============================================================================
+  # Job 1: 複数のイメージをビルド & プッシュ & 署名
+  # ============================================================================
+  build-push-sign:
+    name: Build, Push & Sign
+    runs-on: ubuntu-latest
+    
+    # Matrix strategyで3つのアプリを並列処理
+    strategy:
+      matrix:
+        app: [sample-app-1, sample-app-2, sample-app-3]
+      fail-fast: false  # 1つ失敗しても他は継続
+    
+    outputs:
+      app-1-digest: ${{ steps.push-app-1.outputs.digest }}
+      app-2-digest: ${{ steps.push-app-2.outputs.digest }}
+      app-3-digest: ${{ steps.push-app-3.outputs.digest }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-${{ github.run_id }}
+      
+      - name: Verify AWS identity
+        run: |
+          echo "=== AWS Identity ==="
+          aws sts get-caller-identity
+          echo ""
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.2.4'
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      # 複数のイメージを連続ビルド & プッシュ
+      - name: Build and push multiple images
+        id: build-push
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ matrix.app }}
+          IMAGE_COUNT: ${{ env.IMAGE_COUNT }}
+        run: |
+          echo "=== Building $IMAGE_COUNT images for $ECR_REPOSITORY ==="
+          
+          # 結果を保存するファイル
+          RESULTS_FILE="build-results-$ECR_REPOSITORY.json"
+          echo '{"images": []}' > $RESULTS_FILE
+          
+          for i in $(seq 1 $IMAGE_COUNT); do
+            IMAGE_TAG=$(printf "workflow-%s-%03d" "${{ github.run_number }}" $i)
+            IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+            
+            echo "[$i/$IMAGE_COUNT] Building and pushing: $IMAGE_TAG"
+            
+            # Dockerfileを動的生成（各イメージを異なる内容にする）
+            mkdir -p /tmp/build-$i
+            cat > /tmp/build-$i/Dockerfile << EOF
+          FROM alpine:latest
+          
+          LABEL org.opencontainers.image.source="https://github.com/${{ github.repository }}"
+          LABEL org.opencontainers.image.revision="${{ github.sha }}"
+          LABEL org.opencontainers.image.created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          
+          RUN echo "Repository: $ECR_REPOSITORY" > /image-info.txt && \
+              echo "Image number: $i" >> /image-info.txt && \
+              echo "Workflow run: ${{ github.run_number }}" >> /image-info.txt && \
+              echo "Git SHA: ${{ github.sha }}" >> /image-info.txt && \
+              echo "Build time: \$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> /image-info.txt && \
+              echo "Random: \$RANDOM" >> /image-info.txt
+          
+          CMD cat /image-info.txt
+          EOF
+            
+            # ビルド & プッシュ
+            docker build -t $IMAGE_URI /tmp/build-$i
+            docker push $IMAGE_URI
+            
+            # ダイジェストを取得
+            DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE_URI | cut -d'@' -f2)
+            IMAGE_WITH_DIGEST="$ECR_REGISTRY/$ECR_REPOSITORY@$DIGEST"
+            
+            echo "  Digest: $DIGEST"
+            
+            # 結果をJSON配列に追加
+            jq --arg tag "$IMAGE_TAG" \
+               --arg digest "$DIGEST" \
+               --arg uri "$IMAGE_WITH_DIGEST" \
+               '.images += [{"tag": $tag, "digest": $digest, "uri": $uri}]' \
+               $RESULTS_FILE > tmp.$$ && mv tmp.$$ $RESULTS_FILE
+            
+            # 署名
+            echo "  Signing..."
+            cosign sign --key awskms:///${{ secrets.KMS_KEY_ARN }} \
+              --annotations="workflow-run=${{ github.run_number }}" \
+              --annotations="git-sha=${{ github.sha }}" \
+              --annotations="repository=$ECR_REPOSITORY" \
+              --annotations="image-number=$i" \
+              --yes \
+              $IMAGE_WITH_DIGEST
+            
+            echo "  ✓ Completed: $IMAGE_TAG"
+            echo ""
+          done
+          
+          echo "=== All images built and signed ==="
+          cat $RESULTS_FILE | jq .
+          
+          # アーティファクト用に保存
+          mkdir -p results
+          cp $RESULTS_FILE results/
+      
+      - name: Verify signatures
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ matrix.app }}
+        run: |
+          echo "=== Verifying signatures ==="
+          
+          RESULTS_FILE="build-results-$ECR_REPOSITORY.json"
+          VERIFY_RESULTS="verify-results-$ECR_REPOSITORY.json"
+          echo '{"verifications": []}' > $VERIFY_RESULTS
+          
+          # 各イメージの署名を検証
+          for uri in $(jq -r '.images[].uri' $RESULTS_FILE); do
+            echo "Verifying: $uri"
+            
+            if cosign verify --key awskms:///${{ secrets.KMS_KEY_ARN }} $uri > /dev/null 2>&1; then
+              echo "  ✓ Signature valid"
+              STATUS="valid"
+            else
+              echo "  ✗ Signature invalid"
+              STATUS="invalid"
+            fi
+            
+            jq --arg uri "$uri" \
+               --arg status "$STATUS" \
+               '.verifications += [{"uri": $uri, "status": $status}]' \
+               $VERIFY_RESULTS > tmp.$$ && mv tmp.$$ $VERIFY_RESULTS
+          done
+          
+          echo "=== Verification Results ==="
+          cat $VERIFY_RESULTS | jq .
+          
+          # 結果を保存
+          cp $VERIFY_RESULTS results/
+      
+      - name: Upload build results
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-results-${{ matrix.app }}
+          path: results/
+          retention-days: 30
+  
+  # ============================================================================
+  # Job 2: ライフサイクルポリシーの検証
+  # ============================================================================
+  verify-lifecycle:
+    name: Verify Lifecycle Policy
+    runs-on: ubuntu-latest
+    needs: build-push-sign
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Check image counts
+        id: check-counts
+        run: |
+          echo "=== ECR Image Count Check ==="
+          
+          REPOS=("sample-app-1" "sample-app-2" "sample-app-3")
+          RESULTS_FILE="lifecycle-results.json"
+          echo '{"repositories": []}' > $RESULTS_FILE
+          
+          for repo in "${REPOS[@]}"; do
+            echo ""
+            echo "Repository: $repo"
+            
+            # イメージ数を取得
+            IMAGE_COUNT=$(aws ecr describe-images \
+              --repository-name $repo \
+              --region ${{ env.AWS_REGION }} \
+              --query 'length(imageDetails)' \
+              --output text)
+            
+            echo "  Total images: $IMAGE_COUNT"
+            echo "  Lifecycle limit: ${{ env.LIFECYCLE_LIMIT }}"
+            
+            # 状態判定
+            if [ "$IMAGE_COUNT" -le "${{ env.LIFECYCLE_LIMIT }}" ]; then
+              STATUS="within_limit"
+              MESSAGE="✓ Within lifecycle limit"
+            else
+              EXCESS=$((IMAGE_COUNT - ${{ env.LIFECYCLE_LIMIT }}))
+              STATUS="exceeds_limit"
+              MESSAGE="! Exceeds limit by $EXCESS (auto-deletion pending)"
+            fi
+            
+            echo "  Status: $MESSAGE"
+            
+            # 結果をJSONに追加
+            jq --arg repo "$repo" \
+               --arg count "$IMAGE_COUNT" \
+               --arg limit "${{ env.LIFECYCLE_LIMIT }}" \
+               --arg status "$STATUS" \
+               --arg message "$MESSAGE" \
+               '.repositories += [{"name": $repo, "image_count": ($count | tonumber), "lifecycle_limit": ($limit | tonumber), "status": $status, "message": $message}]' \
+               $RESULTS_FILE > tmp.$$ && mv tmp.$$ $RESULTS_FILE
+          done
+          
+          echo ""
+          echo "=== Summary ==="
+          cat $RESULTS_FILE | jq .
+          
+          # GitHub Actionsの出力に設定
+          echo "results<<EOF" >> $GITHUB_OUTPUT
+          cat $RESULTS_FILE >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          # アーティファクト用
+          mkdir -p results
+          cp $RESULTS_FILE results/
+      
+      - name: Generate detailed report
+        run: |
+          echo "=== Detailed Image Report ==="
+          
+          REPORT_FILE="results/detailed-report.md"
+          mkdir -p results
+          
+          cat > $REPORT_FILE << 'EOF'
+          # ECR Lifecycle Test Report
+          
+          ## Test Information
+          
+          - **Workflow Run**: ${{ github.run_number }}
+          - **Git SHA**: ${{ github.sha }}
+          - **Timestamp**: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          - **Images per repository**: ${{ env.IMAGE_COUNT }}
+          - **Lifecycle limit**: ${{ env.LIFECYCLE_LIMIT }}
+          
+          ## Repository Status
+          
+          EOF
+          
+          # 各リポジトリの詳細
+          for repo in sample-app-1 sample-app-2 sample-app-3; do
+            echo "" >> $REPORT_FILE
+            echo "### Repository: $repo" >> $REPORT_FILE
+            echo "" >> $REPORT_FILE
+            
+            # イメージ一覧
+            echo "#### Images (sorted by push time)" >> $REPORT_FILE
+            echo "" >> $REPORT_FILE
+            echo '```' >> $REPORT_FILE
+            aws ecr describe-images \
+              --repository-name $repo \
+              --region ${{ env.AWS_REGION }} \
+              --query 'sort_by(imageDetails,& imagePushedAt)[*].[imageTags[0], imagePushedAt, imageSizeInBytes]' \
+              --output table >> $REPORT_FILE
+            echo '```' >> $REPORT_FILE
+            echo "" >> $REPORT_FILE
+            
+            # 署名イメージの確認
+            echo "#### Signature Images" >> $REPORT_FILE
+            echo "" >> $REPORT_FILE
+            SIG_COUNT=$(aws ecr describe-images \
+              --repository-name $repo \
+              --region ${{ env.AWS_REGION }} \
+              --query 'length(imageDetails[?contains(imageTags[0], `.sig`)])' \
+              --output text)
+            echo "- Signature images: $SIG_COUNT" >> $REPORT_FILE
+            echo "" >> $REPORT_FILE
+          done
+          
+          # ライフサイクルポリシー
+          echo "## Lifecycle Policy" >> $REPORT_FILE
+          echo "" >> $REPORT_FILE
+          echo '```json' >> $REPORT_FILE
+          aws ecr get-lifecycle-policy \
+            --repository-name sample-app-1 \
+            --region ${{ env.AWS_REGION }} \
+            --query 'lifecyclePolicyText' \
+            --output text >> $REPORT_FILE
+          echo '```' >> $REPORT_FILE
+          
+          echo "" >> $REPORT_FILE
+          echo "## Notes" >> $REPORT_FILE
+          echo "" >> $REPORT_FILE
+          echo "- Lifecycle policies are evaluated every 24 hours" >> $REPORT_FILE
+          echo "- Images exceeding the limit will be deleted automatically" >> $REPORT_FILE
+          echo "- This report shows the state immediately after pushing images" >> $REPORT_FILE
+          
+          cat $REPORT_FILE
+      
+      - name: Upload lifecycle results
+        uses: actions/upload-artifact@v4
+        with:
+          name: lifecycle-results
+          path: results/
+          retention-days: 30
+  
+  # ============================================================================
+  # Job 3: GitHub Summary作成
+  # ============================================================================
+  create-summary:
+    name: Create Summary
+    runs-on: ubuntu-latest
+    needs: [build-push-sign, verify-lifecycle]
+    if: always()
+    
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-results
+      
+      - name: Generate GitHub Summary
+        run: |
+          echo "# 🎯 ECR KMS Cosign & Lifecycle Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## 📊 Test Information" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Workflow Run | \`${{ github.run_number }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Git SHA | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Timestamp | $(date -u +%Y-%m-%dT%H:%M:%SZ) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Images per repo | ${{ env.IMAGE_COUNT }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Lifecycle limit | ${{ env.LIFECYCLE_LIMIT }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## 📦 Build Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # 各アプリのビルド結果を表示
+          for app in sample-app-1 sample-app-2 sample-app-3; do
+            if [ -f "all-results/build-results-$app/build-results-$app.json" ]; then
+              echo "### $app" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              
+              IMAGE_COUNT=$(jq '.images | length' "all-results/build-results-$app/build-results-$app.json")
+              echo "- **Images built**: $IMAGE_COUNT" >> $GITHUB_STEP_SUMMARY
+              
+              # 検証結果
+              if [ -f "all-results/build-results-$app/verify-results-$app.json" ]; then
+                VALID_COUNT=$(jq '[.verifications[] | select(.status == "valid")] | length' "all-results/build-results-$app/verify-results-$app.json")
+                echo "- **Signatures verified**: ✅ $VALID_COUNT/$IMAGE_COUNT" >> $GITHUB_STEP_SUMMARY
+              fi
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+          
+          echo "## 🔄 Lifecycle Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f "all-results/lifecycle-results/lifecycle-results.json" ]; then
+            echo "| Repository | Image Count | Lifecycle Limit | Status |" >> $GITHUB_STEP_SUMMARY
+            echo "|------------|-------------|-----------------|--------|" >> $GITHUB_STEP_SUMMARY
+            
+            jq -r '.repositories[] | "| \(.name) | \(.image_count) | \(.lifecycle_limit) | \(.message) |"' \
+              all-results/lifecycle-results/lifecycle-results.json >> $GITHUB_STEP_SUMMARY
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "## ⚠️ Important Notes" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Lifecycle policies are evaluated every **24 hours**" >> $GITHUB_STEP_SUMMARY
+          echo "- Images exceeding the limit will be deleted automatically" >> $GITHUB_STEP_SUMMARY
+          echo "- Signature images are also counted as separate images" >> $GITHUB_STEP_SUMMARY
+          echo "- Check the detailed report in artifacts for more information" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## 📁 Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Build results: \`build-results-sample-app-*\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Lifecycle results: \`lifecycle-results\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Detailed report: \`detailed-report.md\`" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Check for failures
+        run: |
+          # 失敗したジョブがあるかチェック
+          if [ "${{ needs.build-push-sign.result }}" != "success" ]; then
+            echo "⚠️ Build, push, or sign job failed"
+            exit 1
+          fi
+          
+          if [ "${{ needs.verify-lifecycle.result }}" != "success" ]; then
+            echo "⚠️ Lifecycle verification job failed"
+            exit 1
+          fi
+          
+          echo "✅ All tests passed successfully"
+

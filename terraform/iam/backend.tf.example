@@ -1,0 +1,27 @@
+# Backend Configuration Template
+# 
+# このファイルはテンプレートです。実際の設定は backend.tf に記載してください。
+# 
+# セットアップ手順:
+# 1. このファイルを backend.tf にコピー
+#    cp backend.tf.example backend.tf
+# 
+# 2. <YOUR_BUCKET_NAME> を実際のバケット名に置換
+#    例: sandbox-ecr-kms-tfstate-123456789012-ap-northeast-1
+#    
+#    バケット名の確認方法:
+#    aws s3 ls | grep tfstate
+# 
+# 3. terraform init を実行
+#    terraform init
+
+terraform {
+  backend "s3" {
+    bucket       = "<YOUR_BUCKET_NAME>"  # 例: sandbox-ecr-kms-tfstate-123456789012-ap-northeast-1
+    key          = "iam/terraform.tfstate"
+    region       = "ap-northeast-1"
+    encrypt      = true
+    use_lockfile = true  # State Lock（Terraform v1.10+、DynamoDB不要）
+  }
+}
+
