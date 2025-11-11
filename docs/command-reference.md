@@ -359,7 +359,7 @@ done
 # 署名イメージの一覧
 aws ecr describe-images \
   --repository-name $ECR_REPOSITORY \
-  --query 'imageDetails[?contains(imageTags[0], `.sig`)].{Tag:imageTags[0], Pushed:imagePushedAt}' \
+  --query 'imageDetails[?imageTags && contains(to_string(imageTags), `.sig`)].{Tag:imageTags[0], Pushed:imagePushedAt}' \
   --output table
 ```
 

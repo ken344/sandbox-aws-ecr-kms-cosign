@@ -277,7 +277,7 @@ cosign sign \
 aws ecr describe-images \
   --repository-name $ECR_REPOSITORY \
   --region $AWS_REGION \
-  --query 'imageDetails[?contains(imageTags[0], `.sig`)].{Tag:imageTags[0], Size:imageSizeInBytes, Pushed:imagePushedAt}' \
+  --query 'imageDetails[?imageTags && contains(to_string(imageTags), `.sig`)].{Tag:imageTags[0], Size:imageSizeInBytes, Pushed:imagePushedAt}' \
   --output table
 ```
 
@@ -584,7 +584,7 @@ cosign triangulate $IMAGE_URI_WITH_DIGEST
 # ECR上の署名イメージを確認
 aws ecr describe-images \
   --repository-name $ECR_REPOSITORY \
-  --query 'imageDetails[?contains(imageTags[0], `.sig`)]' \
+  --query 'imageDetails[?imageTags && contains(to_string(imageTags), `.sig`)]' \
   --output table
 ```
 

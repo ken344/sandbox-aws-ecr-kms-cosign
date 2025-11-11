@@ -311,7 +311,7 @@ jobs:
             aws ecr describe-images \
               --repository-name $repo \
               --region ${{ env.AWS_REGION }} \
-              --query 'sort_by(imageDetails,& imagePushedAt)[*].[imageTags[0], imagePushedAt, imageSizeInBytes]' \
+              --query 'sort_by(imageDetails,& imagePushedAt)[*].[imageTags[0] || `<untagged>`, imagePushedAt, imageSizeInBytes]' \
               --output table >> $REPORT_FILE
             echo '```' >> $REPORT_FILE
             echo "" >> $REPORT_FILE
@@ -322,7 +322,7 @@ jobs:
             SIG_COUNT=$(aws ecr describe-images \
               --repository-name $repo \
               --region ${{ env.AWS_REGION }} \
-              --query 'length(imageDetails[?contains(imageTags[0], `.sig`)])' \
+              --query 'length(imageDetails[?imageTags && contains(to_string(imageTags), `.sig`)])' \
               --output text)
             echo "- Signature images: $SIG_COUNT" >> $REPORT_FILE
             echo "" >> $REPORT_FILE

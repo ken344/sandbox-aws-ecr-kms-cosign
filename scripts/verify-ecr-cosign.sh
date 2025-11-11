@@ -221,7 +221,7 @@ else
     
     aws ecr describe-images \
       --repository-name $ECR_REPOSITORY \
-      --query 'imageDetails[?contains(imageTags[0], `.sig`)].{Tag:imageTags[0]}' \
+      --query 'imageDetails[?imageTags && contains(to_string(imageTags), `.sig`)].{Tag:imageTags[0]}' \
       --output table
     
     exit 1
@@ -256,7 +256,7 @@ print_info "署名イメージ:"
 aws ecr describe-images \
   --repository-name $ECR_REPOSITORY \
   --region $AWS_REGION \
-  --query 'imageDetails[?contains(imageTags[0], `.sig`)].{Tag:imageTags[0], Size:imageSizeInBytes, Pushed:imagePushedAt}' \
+  --query 'imageDetails[?imageTags && contains(to_string(imageTags), `.sig`)].{Tag:imageTags[0], Size:imageSizeInBytes, Pushed:imagePushedAt}' \
   --output table 2>/dev/null || true
 
 # 完了
