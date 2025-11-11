@@ -219,7 +219,8 @@ resource "aws_iam_policy" "ecr_repositories_specific" {
           "ecr:CompleteLayerUpload",
           "ecr:DescribeImages",
           "ecr:ListImages",
-          "ecr:DescribeRepositories"
+          "ecr:DescribeRepositories",
+          "ecr:GetLifecyclePolicy"
         ]
         Resource = [
           for repo_name, repo in module.ecr : repo.repository_arn

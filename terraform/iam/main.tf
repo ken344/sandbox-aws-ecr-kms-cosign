@@ -78,6 +78,7 @@ data "aws_iam_policy_document" "ecr_access" {
       "ecr:BatchCheckLayerAvailability",
       "ecr:GetDownloadUrlForLayer",
       "ecr:GetRepositoryPolicy",
+      "ecr:GetLifecyclePolicy",
       "ecr:DescribeRepositories",
       "ecr:ListImages",
       "ecr:DescribeImages",
