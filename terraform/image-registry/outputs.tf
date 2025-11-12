@@ -19,6 +19,16 @@ output "kms_key_alias" {
   value       = try(module.kms_cosign.aliases["${local.project_name}/cosign"], "")
 }
 
+output "kms_key_alias_arn" {
+  description = "KMS key alias ARN (recommended for GitHub Secrets)"
+  value       = try(module.kms_cosign.aliases["${local.project_name}/cosign"].arn, "")
+}
+
+output "kms_key_alias_name" {
+  description = "KMS key alias name"
+  value       = try(module.kms_cosign.aliases["${local.project_name}/cosign"].name, "alias/${local.project_name}/cosign")
+}
+
 # ============================================================================
 # ECR Outputs
 # ============================================================================
@@ -82,9 +92,10 @@ output "github_workflow_config" {
 # ============================================================================
 
 output "github_secrets" {
-  description = "Values to set as GitHub Secrets"
+  description = "Values to set as GitHub Secrets (use alias ARN for better maintainability)"
   value = {
     AWS_REGION         = var.aws_region
+    KMS_KEY_ARN        = try(module.kms_cosign.aliases["${local.project_name}/cosign"].arn, module.kms_cosign.key_arn)
     KMS_KEY_ID         = module.kms_cosign.key_id
     ECR_REGISTRY       = "${local.account_id}.dkr.ecr.${local.region}.amazonaws.com"
     ECR_REPOSITORY_1   = "sample-app-1"

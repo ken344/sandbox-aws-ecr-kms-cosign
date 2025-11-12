@@ -204,7 +204,7 @@ Terraform実行後、以下の値をGitHubリポジトリのSecretsに追加し�
 
 | Name | Value | 取得方法 |
 |------|-------|---------|
-| `KMS_KEY_ID` | `12345678-...` | `terraform output -raw kms_key_id` |
+| `KMS_KEY_ARN` | `arn:aws:kms:...:alias/...` | `terraform output -raw kms_key_alias_arn` （エイリアス推奨） |
 | `ECR_REGISTRY` | `123456789012.dkr.ecr.ap-northeast-1.amazonaws.com` | `terraform output -json github_secrets \| jq -r .ECR_REGISTRY` |
 | `ECR_REPOSITORY_1` | `sample-app-1` | 固定値 |
 | `ECR_REPOSITORY_2` | `sample-app-2` | 固定値 |

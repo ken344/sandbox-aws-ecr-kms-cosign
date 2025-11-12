@@ -93,6 +93,9 @@ AWS ECR、KMS、Cosignを使用したコンテナイメージの署名とライ�
 - [Terraform リソース用バケット管理](./terraform/tfstate/README.md) - リソース用バケットの作成と管理
 - [ローカル検証ガイド](./docs/local-verification-guide.md) - ECR & Cosign署名の検証手順
 - [ライフサイクル手動テストガイド](./docs/manual-lifecycle-test.md) - ライフサイクルポリシーの手動検証
+- [GitHub Secrets 設定ガイド](./docs/github-secrets-setup.md) - Secrets設定とエイリアス使用の推奨
+- [Cosign バージョン移行ガイド](./docs/cosign-version-migration.md) - v2.x から v3.x への移行
+- [Transparency Log (Rekor) 詳細ガイド](./docs/transparency-log-rekor.md) - Rekorの仕組みと使用判断
 - [コマンドリファレンス](./docs/command-reference.md) - よく使うコマンド一覧
 
 ### 実行手順
