@@ -121,6 +121,76 @@ cosign sign --key awskms:///arn:aws:kms:... image@sha256:...
 
 ---
 
+### 5. バンドル形式と関連オプション（v3.x の変更点）
+
+#### 新バンドル形式がデフォルトに
+
+- v3.x では Protocol Buffer ベースの Sigstore bundle が **既定で有効** になりました。
+- `--new-bundle-format` フラグは残っていますがデフォルト値が `true` になっており、明示指定しなくても新形式が使われます。
+- 旧形式に戻したいケースはほぼ無いため、オプトアウトする必要はありません。
+
+#### ローカルにバンドルを書き出したい場合
+
+- v3.x の `cosign sign` にはファイルへ直接書き出す `--bundle` フラグは存在しません。
+- 署名後にスタンドアロンのバンドルを取得したい場合は、`cosign bundle create` などの補助コマンドを利用して、レジストリ上の署名・証明書・Rekor 参照をまとめて `.sigstore` ファイルに変換します。
+- 例（概念的な手順）:
+
+  ```bash
+  # 署名後にバンドルを書き出す一例
+  DIGEST_REF=$(cosign triangulate $IMAGE_URI_WITH_DIGEST)
+  cosign bundle create \
+    --signature "$DIGEST_REF" \
+    --out bundle.sigstore
+  ```
+
+  実際に必要なパラメータは利用するワークフローに応じて調整してください。
+
+#### `--trusted-root` / `--signing-config` の利用場面
+
+- v3.x では、TUF ベースの trusted root をローカルに保持して検証に利用するケースが一般的になりました。`cosign initialize` で生成した `trusted-root.json` をリポジトリに置き、検証時に `--trusted-root ./trusted-root.json` を渡します（`--new-bundle-format` が `true` であることが前提）。
+- 署名・検証時の共通パラメータ（Rekor 設定など）をファイルにまとめたい場合は、`--signing-config config.yaml` と `--use-signing-config` を活用すると CI/CD で管理しやすくなります。
+
+#### 互換性と移行時の注意
+
+- v2.x の従来バンドルも v3.x で検証可能ですが、順次新フォーマットへ移行することが推奨されています。
+- 新しいバンドル形式は主に `cosign bundle` や `cosign verify` で扱う概念であり、署名コマンド自体のフラグ構成は v2.x から大きく変わっていません。
+- v3 系の詳細は公式リリースノート（例: [v3.0.2](https://github.com/sigstore/cosign/releases/tag/v3.0.2)）を参照してください。
+
+#### v3.x で押さえておきたい主要オプション
+
+- `--yes`：GitHub Actions などノンインタラクティブ環境では必須。確認プロンプトをスキップ。
+- `--tlog-upload=false`：プライベートレジストリで Transparency Log を利用しない場合に推奨。
+- `--insecure-ignore-tlog`：`cosign verify` 側で TLog 検証を明示的にスキップ。Rekor へアップロードしていない署名をプライベートに確認したい場合に使用（公的な検証は不可）。
+- `--trusted-root <PATH>`：ローカルにダウンロードした TUF ベースの TrustedRoot で検証する際に使用（`cosign verify` など）。
+- `--signing-config <PATH>`＋`--use-signing-config`：Rekor URL など複数パラメータをファイルにまとめ、CI で再利用したい場合に有効。
+- `--new-bundle-format`：デフォルトで `true` のため明示指定は不要（旧形式に戻す必要がある特殊ケースのみ検討）。
+
+#### プライベートECR＋KMSの推奨サンプル
+
+```bash
+# 署名（GitHub Actionsなどノンインタラクティブ環境想定）
+cosign sign \
+  --key awskms:///${{ secrets.KMS_KEY_ARN }} \
+  --yes \
+  --tlog-upload=false \
+  "${{ env.ECR_REGISTRY }}/${{ env.REPOSITORY }}@${{ env.IMAGE_DIGEST }}"
+
+# 検証（CI内または手動確認用）
+cosign verify \
+  --key awskms:///${{ secrets.KMS_KEY_ARN }} \
+  --insecure-ignore-tlog \
+  "${{ env.ECR_REGISTRY }}/${{ env.REPOSITORY }}@${{ env.IMAGE_DIGEST }}"
+
+# 任意: trusted root を使ったオフライン検証の例
+cosign verify \
+  --key awskms:///${{ secrets.KMS_KEY_ARN }} \
+  --insecure-ignore-tlog \
+  --trusted-root ./trusted-root.json \
+  "${{ env.ECR_REGISTRY }}/${{ env.REPOSITORY }}@${{ env.IMAGE_DIGEST }}"
+```
+
+---
+
 ## このプロジェクトでの対応
 
 ### 現在の設定
@@ -158,7 +228,10 @@ cosign sign \
 
 ```bash
 # 現在の設定（動作する）
-cosign sign --key awskms:///$KMS_KEY_ARN --yes $IMAGE_URI
+cosign sign \
+  --key awskms:///$KMS_KEY_ARN \
+  --yes \
+  $IMAGE_URI
 ```
 
 **メリット**:
@@ -234,10 +307,13 @@ cosign version
 #### 最小限の対応（現在の設定）
 
 ```bash
-cosign sign --key awskms:///$KMS_KEY_ARN --yes $IMAGE_URI
+cosign sign \
+  --key awskms:///$KMS_KEY_ARN \
+  --yes \
+  $IMAGE_URI
 ```
 
-このままでOK（動作確認済み）
+このままでOK（動作確認済み）。署名成果物をローカルに残したい場合は `cosign save` や `cosign bundle create` など別コマンドで取得します。
 
 #### より明示的な設定
 
@@ -284,7 +360,11 @@ Warning: transparency log entry not found
 
 ```bash
 # 署名時
-cosign sign --key awskms:///$KMS_KEY_ARN --yes --tlog-upload=false $IMAGE_URI
+cosign sign \
+  --key awskms:///$KMS_KEY_ARN \
+  --yes \
+  --tlog-upload=false \
+  $IMAGE_URI
 
 # 検証時
 cosign verify --key awskms:///$KMS_KEY_ARN --insecure-ignore-tlog $IMAGE_URI
@@ -388,7 +468,11 @@ cosign-release: 'latest'
 
 ```bash
 # 署名
-cosign sign --key awskms:///$KMS_KEY_ARN --yes --tlog-upload=false $IMAGE
+cosign sign \
+  --key awskms:///$KMS_KEY_ARN \
+  --yes \
+  --tlog-upload=false \
+  $IMAGE
 
 # 検証
 cosign verify --key awskms:///$KMS_KEY_ARN --insecure-ignore-tlog $IMAGE
@@ -399,7 +483,10 @@ cosign verify --key awskms:///$KMS_KEY_ARN --insecure-ignore-tlog $IMAGE
 ```bash
 # デバッグモード
 export COSIGN_EXPERIMENTAL=1
-cosign sign --key awskms:///$KMS_KEY_ARN --yes $IMAGE
+cosign sign \
+  --key awskms:///$KMS_KEY_ARN \
+  --yes \
+  $IMAGE
 ```
 
 ---
@@ -475,10 +562,17 @@ cosign version
 
 ```bash
 # v2.x と同じコマンドが基本的に動作
-cosign sign --key awskms:///$KMS_KEY_ARN --yes $IMAGE_URI
+cosign sign \
+  --key awskms:///$KMS_KEY_ARN \
+  --yes \
+  $IMAGE_URI
 
 # プライベート環境でRekor警告を避ける場合
-cosign sign --key awskms:///$KMS_KEY_ARN --yes --tlog-upload=false $IMAGE_URI
+cosign sign \
+  --key awskms:///$KMS_KEY_ARN \
+  --yes \
+  --tlog-upload=false \
+  $IMAGE_URI
 cosign verify --key awskms:///$KMS_KEY_ARN --insecure-ignore-tlog $IMAGE_URI
 ```
 
@@ -503,8 +597,11 @@ cosign-release: 'v3.0.2'  # v2.2.4 から更新
 #### 署名コマンド
 
 ```bash
-# 現在の実装（シンプル版、動作確認済み）
-cosign sign --key awskms:///$KMS_KEY_ARN --yes $IMAGE_URI
+# 現在の実装（v3.0.2 対応版）
+cosign sign \
+  --key awskms:///$KMS_KEY_ARN \
+  --yes \
+  $IMAGE_URI
 ```
 
 **動作確認**:
@@ -599,7 +696,10 @@ cosign verify \
 
 ```bash
 # v2で署名
-cosign sign --key awskms:///$KMS_KEY_ARN --yes $IMAGE_URI
+cosign sign \
+  --key awskms:///$KMS_KEY_ARN \
+  --yes \
+  $IMAGE_URI
 
 # v3で検証
 cosign verify --key awskms:///$KMS_KEY_ARN $IMAGE_URI
@@ -614,7 +714,11 @@ cosign verify --key awskms:///$KMS_KEY_ARN $IMAGE_URI
 
 ```bash
 # v3で署名
-cosign sign --key awskms:///$KMS_KEY_ARN --yes --tlog-upload=false $IMAGE_URI
+cosign sign \
+  --key awskms:///$KMS_KEY_ARN \
+  --yes \
+  --tlog-upload=false \
+  $IMAGE_URI
 
 # v2で検証
 cosign verify --key awskms:///$KMS_KEY_ARN $IMAGE_URI
@@ -629,10 +733,17 @@ cosign verify --key awskms:///$KMS_KEY_ARN $IMAGE_URI
 
 ```bash
 # なくても動作する（警告が出る可能性）
-cosign sign --key awskms:///$KMS_KEY_ARN --yes $IMAGE_URI
+cosign sign \
+  --key awskms:///$KMS_KEY_ARN \
+  --yes \
+  $IMAGE_URI
 
 # 明示的にスキップ（推奨）
-cosign sign --key awskms:///$KMS_KEY_ARN --yes --tlog-upload=false $IMAGE_URI
+cosign sign \
+  --key awskms:///$KMS_KEY_ARN \
+  --yes \
+  --tlog-upload=false \
+  $IMAGE_URI
 ```
 
 ---
@@ -643,10 +754,16 @@ cosign sign --key awskms:///$KMS_KEY_ARN --yes --tlog-upload=false $IMAGE_URI
 
 ```bash
 # ✅ v2
-cosign sign --key awskms:///alias/my-key --yes $IMAGE_URI
+cosign sign \
+  --key awskms:///alias/my-key \
+  --yes \
+  $IMAGE_URI
 
 # ✅ v3
-cosign sign --key awskms:///alias/my-key --yes $IMAGE_URI
+cosign sign \
+  --key awskms:///alias/my-key \
+  --yes \
+  $IMAGE_URI
 ```
 
 ---
@@ -702,7 +819,10 @@ cosign sign \
     cosign-release: 'v3.0.2'
 
 # 署名（シンプル版、現在の設定）
-cosign sign --key awskms:///${{ secrets.KMS_KEY_ARN }} --yes $IMAGE_URI
+cosign sign \
+  --key awskms:///${{ secrets.KMS_KEY_ARN }} \
+  --yes \
+  $IMAGE_URI
 
 # 検証
 cosign verify --key awskms:///${{ secrets.KMS_KEY_ARN }} $IMAGE_URI

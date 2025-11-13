@@ -137,7 +137,7 @@ jobs:
                '.images += [{"tag": $tag, "digest": $digest, "uri": $uri}]' \
                $RESULTS_FILE > tmp.$$ && mv tmp.$$ $RESULTS_FILE
             
-            # 署名
+            # 署名（プライベートECR用：Rekorへのアップロードをスキップ）
             echo "  Signing..."
             cosign sign --key awskms:///${{ secrets.KMS_KEY_ARN }} \
               --annotations="workflow-run=${{ github.run_number }}" \
@@ -145,6 +145,7 @@ jobs:
               --annotations="repository=$ECR_REPOSITORY" \
               --annotations="image-number=$i" \
               --yes \
+              --tlog-upload=false \
               $IMAGE_WITH_DIGEST
             
             echo "  ✓ Completed: $IMAGE_TAG"
@@ -169,11 +170,11 @@ jobs:
           VERIFY_RESULTS="verify-results-$ECR_REPOSITORY.json"
           echo '{"verifications": []}' > $VERIFY_RESULTS
           
-          # 各イメージの署名を検証
+          # 各イメージの署名を検証（プライベートECR用：Transparency Log検証をスキップ）
           for uri in $(jq -r '.images[].uri' $RESULTS_FILE); do
             echo "Verifying: $uri"
             
-            if cosign verify --key awskms:///${{ secrets.KMS_KEY_ARN }} $uri > /dev/null 2>&1; then
+            if cosign verify --key awskms:///${{ secrets.KMS_KEY_ARN }} --insecure-ignore-tlog $uri > /dev/null 2>&1; then
               echo "  ✓ Signature valid"
               STATUS="valid"
             else

@@ -207,7 +207,7 @@ jobs:
             echo "[$((i + 1))/$IMAGE_COUNT] Signing: $TAG"
             echo "  URI: $URI"
             
-            # 署名
+            # 署名（プライベートECR用：Rekorへのアップロードをスキップ）
             if cosign sign --key awskms:///$KMS_KEY_ARN \
               --annotations="workflow-run=${{ github.run_number }}" \
               --annotations="git-sha=${{ github.sha }}" \
@@ -215,6 +215,7 @@ jobs:
               --annotations="image-number=$NUM" \
               --annotations="tag=$TAG" \
               --yes \
+              --tlog-upload=false \
               $URI; then
               echo "  ✓ Signed successfully"
               STATUS="signed"
@@ -260,8 +261,8 @@ jobs:
             echo ""
             echo "[$((i + 1))/$IMAGE_COUNT] Verifying: $TAG"
             
-            # 検証
-            if cosign verify --key awskms:///$KMS_KEY_ARN $URI > /dev/null 2>&1; then
+            # 検証（プライベートECR用：Transparency Log検証をスキップ）
+            if cosign verify --key awskms:///$KMS_KEY_ARN --insecure-ignore-tlog $URI > /dev/null 2>&1; then
               echo "  ✓ Signature valid"
               STATUS="valid"
               VALID_COUNT=$((VALID_COUNT + 1))
